@@ -16,10 +16,7 @@
  *
  **********************************************************/
 
-include("/home/zepadm/public_html/includes/config.php");
-
-
-$db = new PDO("mysql:host=".$dbinfo["host"].";dbname=".$dbinfo["db"]."", $dbinfo["user"], $dbinfo["password"]);
+$db = new PDO("mysql:host=host;dbname=db,user,password");//invalid
 
 $res = $db->query("SELECT `var` FROM `{$dbinfo["prefix"]}settings` WHERE `config`='maintenance' LIMIT 1");
 if ($res==false) 
