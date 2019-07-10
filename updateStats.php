@@ -1,6 +1,6 @@
 <?php
 /***********************************************************
- *  Statistics processing and updating script:
+ *  zeep.ly Statistics Updater Script:
  *  
  *  (c) 2019, Thanasis Karpetis (tkarpetis@gmail.com)
  *
@@ -8,68 +8,121 @@
  *  keeping clicks per url and time interval, country,
  *  browser, os and referrer.
  *
- *  This file is meant to be run as a cron job. The frequency 
- *  setting depends on preference and aliasing avoidance.
- *  - DB Must be mysql or mariadb, some specific queries included.
+ *  This file is meant to be run as a cron job.
  *
- *
- *    This program is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU General Public License as published by
- *    the Free Software Foundation, either version 3 of the License, or
- *    (at your option) any later version.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU General Public License for more details.
- *
- *    You should have received a copy of the GNU General Public License
- *    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *  The file structure was based on the updater
+ *  file shipped with Premium URL Shortener, and is
+ *  using parts thereof to promote familiarity.
  *
  **********************************************************/
 
-//you have this if you own the shortener code
-include("includes/config.php");
+include("/home/zepadm/public_html/includes/config.php");
+
 
 $db = new PDO("mysql:host=".$dbinfo["host"].";dbname=".$dbinfo["db"]."", $dbinfo["user"], $dbinfo["password"]);
 
-$query=get_query($dbinfo);
+$res = $db->query("SELECT `var` FROM `{$dbinfo["prefix"]}settings` WHERE `config`='maintenance' LIMIT 1");
+if ($res==false) 
+    exit();
+$maintenance = $res->fetch(PDO::FETCH_ASSOC);
+
+if ($maintenance["var"]=='1')
+    exit();
+//------odd-even stat table backups-----
+
+$res= $db->query("SELECT NOW() AS `now`");
+$weeknum=getWeek($res,"now",(int)floor(time()/(7*24*3600)));
+
+
+$res= $db->query("SELECT MAX(`date`) AS `latest` FROM `{$dbinfo["prefix"]}t_last_stat` LIMIT 1");
+$prevweek=getWeek($res,"latest",$weeknum);
+
+if ($weeknum%2 ==1) 	
+    $stat_suffix="odd";
+else
+    $stat_suffix="even";
+
+if ($weeknum != $prevweek) { //new week starting now, purge all records older than last week
+       $db->query("TRUNCATE TABLE `{$dbinfo["prefix"]}t_stats_{$stat_suffix}`");	
+       $db->query("OPTIMIZE TABLE `{$dbinfo["prefix"]}t_stats_{$stat_suffix}`");
+}
+
+
+//- up to here-------------------
+
+$query=get_query($dbinfo,$stat_suffix);
 $i=0;
 $numerrors=0;
 foreach ($query as $q) {
 	++$i;
 	if ($db->query($q)==false) {
 		++$numerrors;
+		//$numerrors=$i;
 		echo "error in query",i,"\n";
 	}
 }
 // final action, report on this update.
 $db->query("INSERT INTO `{$dbinfo["prefix"]}t_last_stat`(`last_statid`,`date`,`errors`)"
 		." VALUES(@endid, now(),{$numerrors})");
-?>
+		
+unset($maintenance);
+unset($res);
+unset($config);
+unset($query);
+unset($dbinfo);
+unset($db);		
 
-<?php
-function get_query($dbinfo) {
+//----------------------------------------------------------------------------------------------------------
+
+function getWeek( $queryres, $fieldname, $defaultval) {
+    
+    if ($queryres==false) {  //query failed to execute
+         $res=$defaultval;
+    }
+    else {
+        $array=$queryres->fetch(PDO::FETCH_ASSOC);
+        $timestring=$array[$fieldname];
+        $res =(int)floor(strtotime($timestring)/(7*24*3600));//convert to timestamp, then to whole weeks
+    }    
+    return $res;
+    
+}
+
+//----------------------------------------------------------------------------------------------------------
+
+function get_query($dbinfo,$stat_suffix) {
 	$query=array();
+	//start transaction
 	
 	//start and ending id for the stats records. will be used throughout and recorded in the end.
-	$query[]="SELECT @startid:=(SELECT max(`last_statid`) FROM `{$dbinfo["prefix"]}t_last_stat`)"; //this was included in the last update
-	$query[]="SELECT @thelast:=( SELECT max(`id`) FROM `{$dbinfo["prefix"]}stats`)";
+	//
+	$query[]="SELECT max(`last_statid`) FROM `{$dbinfo["prefix"]}t_last_stat` INTO @startid"; //this was included in the last update
+	$query[]="SELECT max(`id`) FROM `{$dbinfo["prefix"]}stats` INTO @thelast";
 
-	$query[]="SET @maxrows:=400000"; // tweak this number to adjust runtime.
+	
+	$query[]="SET @maxrows:=200000"; // tweak this number to adjust runtime.
 
 	// do not allow the UPDATE to encompass too much in a run, this is a frequently run file.
 	$query[]="SET @endid:= ( SELECT IF ( @startid+@maxrows < @thelast, @startid + @maxrows, @thelast) )";
-	$query[]="SET @startid:= @startid+1";
+	
+	$query[]="SELECT min(`id`) FROM `{$dbinfo["prefix"]}stats` into @deletestart"; //the start of the delete interval
+	$query[]="SET @deleteend:= (SELECT IF ( @deletestart+@maxrows > @endid, @endid, @deletestart + @maxrows) )";
+	
+    $query[]="SET @startid:= @startid+1"; // not to include previous last
+    
+    $query[]="SET @copystart:= 132118255";// playing cautious, ensuring return to original version for a few days
+
+	$query[]="SET @copystart:= (SELECT IF ( @deletestart > @copystart, @deletestart, @copystart) )";// playing cautious, ensuring return to original version for a few days
+	$query[]="SET @copyend:= @deleteend";
+    
 //=======================================CLICK STATS UPDATE=====================================================
 //
 //	IMPORTANT: 	in t_click_url, type 1,2,3 are day,month,year aggregate click stats
-//			following this pattern, t_temp_clicks use 
-//				[type]+6 for new or still useful records and 
-//				[type]+3 for temporary 'used' status.
+//			following this, t_temp_clicks use [type]+6 for new or still useful records
+//			and [type]+3 for temporary 'used' status.
 //			Aggregate clicks are gathered by day, then used to produce per month clicks
 //			which in turn are used to create per year entries.	
-//			Aggregate stats too far out of reporting rage are prunned.
+//
 
 //per day:-----------------------------------------------------------
 	//first insert all new stats per day from startidid up to endid, per url in temp_clicks as type 7
@@ -321,17 +374,19 @@ function get_query($dbinfo) {
 
 //-----referrer done-------------------
 	
-	
-//raw stats records are no longer needed.
-	$query[]="DELETE FROM `{$dbinfo["prefix"]}stats` WHERE `id`<=@endid";
-	
-//delete daily and monthly stats too far in the past, they are not reported anyway.
+    $query[]="INSERT INTO `{$dbinfo["prefix"]}stats_new` ( SELECT * FROM `{$dbinfo["prefix"]}stats` WHERE `id` between @copystart and @copyend )";	//remove this after two weeks have passed. sat july 6 2019.
+    $query[]="INSERT INTO `{$dbinfo["prefix"]}t_stats_{$stat_suffix}` ( SELECT * FROM `{$dbinfo["prefix"]}stats` WHERE `id` between @copystart and @copyend )";	
+    
+//stats records are no longer needed. deleting little by little.
+	$query[]="DELETE FROM `{$dbinfo["prefix"]}stats` WHERE `id` between @deletestart and @deleteend";
+
+//delete daily stats for days too far in the past
 	$query[]="DELETE FROM `{$dbinfo["prefix"]}t_click_url` WHERE `type`=1 AND `date`< (CURRENT_DATE()-INTERVAL 62 DAY)";
 	$query[]="DELETE FROM `{$dbinfo["prefix"]}t_click_url` WHERE `type`=2 AND `date`< (CURRENT_DATE()-INTERVAL 25 MONTH)";
 	$query[]="DELETE FROM `{$dbinfo["prefix"]}t_last_stat` WHERE  `date`< (CURRENT_DATE()-INTERVAL 30 DAY)";
 
 //compact stats TABLE
-//	$query[]="OPTIMIZE TABLE `{$dbinfo["prefix"]}stats`";//enable this when the table is close to empty, and any big overhead has been manually dealt with.
+	$query[]="OPTIMIZE TABLE `{$dbinfo["prefix"]}stats`";//enable this when the table is fully incorporated
 	$query[]="OPTIMIZE TABLE `{$dbinfo["prefix"]}t_click_url`";
 	$query[]="OPTIMIZE TABLE `{$dbinfo["prefix"]}t_last_stat`";
 	$query[]="OPTIMIZE TABLE `{$dbinfo["prefix"]}t_temp_catstat`";
